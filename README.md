@@ -80,12 +80,14 @@ Selected URL query parameters are also recognised, useful for embedding in
 ?source=IP    same as --u64stream-source=IP
 ```
 
-Aspect-ratio defaults match VICE's authentic VIC-II values:
-- PAL: 117:125 (≈0.936)
-- NTSC: 3:4 (0.75)
+Aspect-ratio defaults make the full frame display at **4:3** (CRT-era look):
+- PAL: 17:18 (≈0.944) — 384×272 → 4:3 exact
+- NTSC: 5:6 (≈0.833) — 384×240 → 4:3 exact
 
-Pass `--u64stream-sar-num=1 --u64stream-sar-den=1` for raw square pixels
-(the picture will look slightly wide-ish).
+Override with `--u64stream-sar-num` / `--u64stream-sar-den` if you prefer
+something else. Common alternatives:
+- `117:125` (PAL) / `3:4` (NTSC) — strict VIC-II pixel aspect (what VICE uses)
+- `1:1` — raw square pixels (slightly wide-ish on a 4:3 monitor)
 
 ## Building
 

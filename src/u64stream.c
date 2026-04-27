@@ -110,13 +110,22 @@
 #define U64S_MODE_PAL    0
 #define U64S_MODE_NTSC   1
 
-/* Default sample-aspect-ratio per mode. The classic VIC-II PAL pixel
- * aspect ratio (used by VICE) is ~0.9365; we ship 117:125 = 0.9360 for PAL
- * and the ~0.75 NTSC value as 3:4. */
-#define U64S_PAL_SAR_NUM   117
-#define U64S_PAL_SAR_DEN   125
-#define U64S_NTSC_SAR_NUM    3
-#define U64S_NTSC_SAR_DEN    4
+/* Default sample-aspect-ratio per mode.
+ *
+ * We default to "full 384x{272|240} buffer displays at 4:3" rather than
+ * the strictly-pixel-accurate VIC-II ratio, because that's what real
+ * C64 monitors looked like and what most users expect. Math:
+ *   SAR = (4/3) / (W/H) = 4*H / (3*W)
+ *   PAL:  4*272 / (3*384) = 1088 / 1152 = 17:18  ~= 0.9444
+ *   NTSC: 4*240 / (3*384) =  960 / 1152 =  5:6   ~= 0.8333
+ *
+ * For purists who want the strict VIC-II pixel aspect (PAL ~0.9365,
+ * NTSC ~0.75 as VICE uses), pass --u64stream-sar-num=117
+ * --u64stream-sar-den=125 (or 3:4 for NTSC). */
+#define U64S_PAL_SAR_NUM    17
+#define U64S_PAL_SAR_DEN    18
+#define U64S_NTSC_SAR_NUM    5
+#define U64S_NTSC_SAR_DEN    6
 
 /* Process-global instance counter. VLC opens any URL multiple times for
  * the same playlist entry (preparse / art-fetch / playback). Each open
@@ -185,10 +194,12 @@ static const uint32_t u64s_palette[16] = {
                                 "devices broadcast on the same LAN.")
 #define U64S_SARNUM_TEXT     N_("Sample aspect ratio numerator (0 = default)")
 #define U64S_SARNUM_LONG     N_("Override the pixel aspect ratio numerator. " \
-                                "Default per mode: PAL 117:125 (~0.936), " \
-                                "NTSC 3:4 (0.75). Use --u64stream-sar-num=1 " \
-                                "--u64stream-sar-den=1 for raw square " \
-                                "pixels.")
+                                "Defaults make the full 384x272 (PAL) or " \
+                                "384x240 (NTSC) frame display at 4:3 — " \
+                                "PAL 17:18 (~0.944), NTSC 5:6 (~0.833). " \
+                                "For strict VIC-II pixel-accurate aspect " \
+                                "use 117:125 (PAL) or 3:4 (NTSC). " \
+                                "1:1 gives raw square pixels.")
 #define U64S_SARDEN_TEXT     N_("Sample aspect ratio denominator (0 = default)")
 #define U64S_SARDEN_LONG     N_("See --u64stream-sar-num.")
 
@@ -1128,6 +1139,11 @@ static int Open( vlc_object_t *obj )
     else
     {
         msg_Info( demux, "video disabled by --u64stream-no-video" );
+        /* No video means no first-frame mode auto-detection; if the user
+         * didn't pin a mode explicitly we default to PAL so audio can
+         * start flowing. Mark detection complete either way. */
+        if( !sys->detected )
+            u64s_apply_mode( sys, U64S_MODE_PAL );
     }
     if( !no_audio )
     {
