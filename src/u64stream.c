@@ -997,6 +997,28 @@ static void u64s_parse_url( demux_t *demux,
     if( bindpart != NULL && *bindpart != '\0' )
         *out_bind  = strdup( bindpart );
 
+    /* The U64 II's web UI generates m3u files with URLs like
+     *   u64://@239.0.1.64:11000
+     * — the "@host" form, which traditionally means "bind to that local
+     * interface". For us it's a multicast group (the U64 just doesn't
+     * follow VLC's group@bind convention). If the parsed bind address is
+     * actually an IPv4 multicast (224.0.0.0/4), move it to the group so
+     * audio multicast group auto-derivation kicks in. */
+    if( *out_group == NULL && *out_bind != NULL )
+    {
+        struct in_addr a;
+        if( inet_pton( AF_INET, *out_bind, &a ) == 1 )
+        {
+            uint32_t hostorder = ntohl( a.s_addr );
+            uint8_t first = (uint8_t)((hostorder >> 24) & 0xFFu);
+            if( first >= 224 && first <= 239 )
+            {
+                *out_group = *out_bind;
+                *out_bind  = NULL;
+            }
+        }
+    }
+
     free( work );
 }
 
