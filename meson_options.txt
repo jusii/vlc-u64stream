@@ -1,0 +1,5 @@
+option('vlc_plugin_dir',
+  type: 'string',
+  value: '',
+  description: 'VLC plugins install directory. Empty = $libdir/vlc/plugins/access.',
+)

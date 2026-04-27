@@ -1,0 +1,9 @@
+build/
+*.o
+*.so
+*.dylib
+*.dll
+*.swp
+.cache/
+compile_commands.json
+.vscode/
