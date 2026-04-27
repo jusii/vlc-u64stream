@@ -43,11 +43,47 @@
 #define _POSIX_C_SOURCE 200809L
 #define _DEFAULT_SOURCE  /* strcasecmp() pulled in by <vlc_stream.h> */
 
-#include <strings.h>
-#include <poll.h>
-#include <arpa/inet.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
+#include <errno.h>
+#include <stdbool.h>
+
+/* ---- Cross-platform socket / sleep / non-blocking abstractions ---------- */
+
+#ifdef _WIN32
+# define WIN32_LEAN_AND_MEAN
+# include <winsock2.h>
+# include <ws2tcpip.h>
+# include <windows.h>
+# define u64s_msleep(ms)        Sleep((DWORD)(ms))
+# define u64s_poll              WSAPoll
+# define U64S_INVALID_FD        (-1)
+  static inline int u64s_set_nonblock(int fd) {
+      u_long m = 1;
+      return ioctlsocket((SOCKET)fd, FIONBIO, &m) == 0 ? 0 : -1;
+  }
+  static inline int  u64s_sock_errno(void)   { return WSAGetLastError(); }
+  static inline bool u64s_would_block(int e) { return e == WSAEWOULDBLOCK; }
+  static inline bool u64s_was_intr  (int e) { return e == WSAEINTR; }
+#else
+# include <strings.h>
+# include <poll.h>
+# include <arpa/inet.h>
+# include <sys/socket.h>
+# include <netinet/in.h>
+# include <unistd.h>
+# include <fcntl.h>
+# define u64s_msleep(ms)        usleep((useconds_t)(ms) * 1000)
+# define u64s_poll              poll
+# define U64S_INVALID_FD        (-1)
+  static inline int u64s_set_nonblock(int fd) {
+      int flags = fcntl(fd, F_GETFL, 0);
+      if (flags < 0) return -1;
+      return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+  }
+  static inline int  u64s_sock_errno(void)   { return errno; }
+  static inline bool u64s_would_block(int e) { return e == EAGAIN
+                                                    || e == EWOULDBLOCK; }
+  static inline bool u64s_was_intr  (int e) { return e == EINTR; }
+#endif
 
 #include <vlc_common.h>
 #include <vlc_plugin.h>
@@ -61,7 +97,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
-#include <unistd.h>
 #include <stdatomic.h>
 
 /* VLC's plugin macros expect these gettext shims to exist in the TU.
@@ -346,19 +381,21 @@ static int u64s_open_socket( demux_t *demux, const char *bindhost,
     return fd;
 }
 
-/* recvfrom() one datagram with MSG_DONTWAIT (non-blocking). Returns:
+/* recvfrom() one datagram from a non-blocking socket. Returns:
  *   >0  bytes read
  *    0  packet dropped by source filter
- *   -1  with errno=EAGAIN/EWOULDBLOCK  → queue is empty (call drained)
- *   -1  with another errno              → real error
- * The drain loop in Demux() relies on the EAGAIN signal. */
+ *   -1  with would-block / interrupted errno → queue is empty / retry
+ *   -1  with another errno → real error
+ * The drain loop in Demux() relies on the would-block signal. The socket
+ * is set non-blocking at open time so we don't need MSG_DONTWAIT (which
+ * isn't portable to Windows). */
 static ssize_t u64s_recv_filtered( demux_t *demux, int fd,
                                    void *buf, size_t buflen )
 {
     demux_sys_t *sys = demux->p_sys;
     struct sockaddr_in sa;
     socklen_t sl = (socklen_t)sizeof(sa);
-    ssize_t n = recvfrom( fd, buf, buflen, MSG_DONTWAIT,
+    ssize_t n = recvfrom( fd, buf, (int)buflen, 0,
                           (struct sockaddr *)&sa, &sl );
     if( n < 0 )
         return n;
@@ -702,12 +739,13 @@ static int Demux( demux_t *demux )
         return VLC_DEMUXER_EOF;
 
     /* 100 ms timeout keeps the input thread responsive to shutdown. */
-    int rc = poll( pfd, nfds, 100 );
+    int rc = u64s_poll( pfd, nfds, 100 );
     if( rc < 0 )
     {
-        if( errno == EINTR )
+        int e = u64s_sock_errno();
+        if( u64s_was_intr(e) )
             return VLC_DEMUXER_SUCCESS;
-        msg_Err( demux, "poll() failed: %s", vlc_strerror_c(errno) );
+        msg_Err( demux, "poll() failed: errno=%d", e );
         return VLC_DEMUXER_EGENERIC;
     }
     if( rc == 0 )
@@ -730,11 +768,10 @@ static int Demux( demux_t *demux )
                                             buf, sizeof(buf) );
             if( n < 0 )
             {
-                if( errno == EAGAIN || errno == EWOULDBLOCK
-                                    || errno == EINTR )
+                int e = u64s_sock_errno();
+                if( u64s_would_block(e) || u64s_was_intr(e) )
                     break;
-                msg_Err( demux, "video recvfrom: %s",
-                         vlc_strerror_c(errno) );
+                msg_Err( demux, "video recvfrom: errno=%d", e );
                 break;
             }
             if( n == 0 )
@@ -752,11 +789,10 @@ static int Demux( demux_t *demux )
                                             buf, sizeof(buf) );
             if( n < 0 )
             {
-                if( errno == EAGAIN || errno == EWOULDBLOCK
-                                    || errno == EINTR )
+                int e = u64s_sock_errno();
+                if( u64s_would_block(e) || u64s_was_intr(e) )
                     break;
-                msg_Err( demux, "audio recvfrom: %s",
-                         vlc_strerror_c(errno) );
+                msg_Err( demux, "audio recvfrom: errno=%d", e );
                 break;
             }
             if( n == 0 )
@@ -1000,10 +1036,10 @@ static void u64s_send_start_sequence( demux_t *demux, const char *spec )
 
     /* The U64 telnet endpoint processes one byte at a time slowly.
      * Mimic u64view's pacing: short initial pause, then 1-byte sends. */
-    usleep( 10 * 1000 );
+    u64s_msleep( 10 );
     for( size_t i = 0; i < sizeof(U64S_START_SEQ); ++i )
     {
-        usleep( 1 * 1000 );
+        u64s_msleep( 1 );
         ssize_t n = net_Write( demux, fd, &U64S_START_SEQ[i], 1 );
         if( n <= 0 )
         {
@@ -1135,6 +1171,9 @@ static int Open( vlc_object_t *obj )
             atomic_fetch_sub( &u64s_live_instances, 1 );
             return VLC_EGENERIC;
         }
+        /* Non-blocking so the drain loop in Demux() can detect "queue
+         * empty" via WOULDBLOCK without MSG_DONTWAIT (Windows-portable). */
+        u64s_set_nonblock( sys->fd_video );
     }
     else
     {
@@ -1189,6 +1228,8 @@ static int Open( vlc_object_t *obj )
         free( audio_group );
         if( sys->fd_audio < 0 )
             msg_Warn( demux, "audio socket failed to open; video-only" );
+        else
+            u64s_set_nonblock( sys->fd_audio );
     }
     free( group );
     free( bindhost );

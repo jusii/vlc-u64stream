@@ -1,0 +1,132 @@
+name: build
+
+on:
+  push:
+    branches: [master, main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  linux:
+    name: Linux (Ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            meson ninja-build pkg-config build-essential \
+            libvlccore-dev libvlc-dev
+
+      - name: Configure
+        run: meson setup build --buildtype=release
+
+      - name: Compile
+        run: meson compile -C build
+
+      - name: Show artefact
+        run: ls -la build/libu64stream_plugin.so
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: u64stream-linux-x86_64
+          path: build/libu64stream_plugin.so
+          if-no-files-found: error
+
+  windows:
+    name: Windows (MSYS2 / MinGW64)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up MSYS2 + MinGW64
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-toolchain
+            mingw-w64-x86_64-meson
+            mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-pkgconf
+            mingw-w64-x86_64-vlc
+
+      - name: Sanity-check VLC SDK
+        run: |
+          pkg-config --modversion vlc-plugin || true
+          pkg-config --cflags vlc-plugin || true
+
+      - name: Configure
+        run: meson setup build --buildtype=release
+
+      - name: Compile
+        run: meson compile -C build
+
+      - name: Show artefact
+        run: ls -la build/libu64stream_plugin.dll || ls -la build/u64stream_plugin.dll || ls -la build/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: u64stream-windows-x86_64
+          path: |
+            build/*.dll
+            build/*plugin*
+          if-no-files-found: error
+
+  macos:
+    name: macOS (Apple Silicon)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: brew install meson ninja pkg-config
+
+      - name: Install VLC and locate SDK
+        run: |
+          brew install --cask vlc
+          # The .app bundle ships the plugin headers inside it.
+          VLC_APP="/Applications/VLC.app/Contents/MacOS"
+          if [ ! -d "$VLC_APP/include/vlc/plugins" ]; then
+            echo "VLC.app does not contain plugin headers at $VLC_APP/include/vlc/plugins" >&2
+            ls -la "$VLC_APP" || true
+            exit 1
+          fi
+          # Synthesize a vlc-plugin.pc so meson can find it.
+          PCDIR="$RUNNER_TEMP/pkgconfig"
+          mkdir -p "$PCDIR"
+          VLC_VERSION="$(/Applications/VLC.app/Contents/MacOS/VLC --version | head -1 | awk '{print $3}')"
+          cat > "$PCDIR/vlc-plugin.pc" <<EOF
+          prefix=$VLC_APP
+          includedir=\${prefix}/include
+          libdir=\${prefix}/lib
+
+          Name: vlc-plugin
+          Description: VLC plugin SDK
+          Version: ${VLC_VERSION:-3.0.0}
+          Cflags: -I\${includedir}/vlc/plugins -D__PLUGIN__ -D_FILE_OFFSET_BITS=64 -D_REENTRANT -D_THREAD_SAFE
+          Libs: -L\${libdir} -lvlccore
+          EOF
+          echo "PKG_CONFIG_PATH=$PCDIR" >> "$GITHUB_ENV"
+          cat "$PCDIR/vlc-plugin.pc"
+
+      - name: Configure
+        run: meson setup build --buildtype=release
+
+      - name: Compile
+        run: meson compile -C build
+
+      - name: Show artefact
+        run: ls -la build/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: u64stream-macos
+          path: build/*.dylib
+          if-no-files-found: error

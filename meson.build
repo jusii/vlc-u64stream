@@ -12,7 +12,8 @@ cc = meson.get_compiler('c')
 
 vlc_plugin = dependency('vlc-plugin', version: '>=3.0.0')
 
-# VLC plugins are loaded via dlopen; export only the module entry point.
+# VLC plugins are loaded via dlopen / LoadLibrary; export only the module
+# entry point. The SDK macros do that on each platform automatically.
 plugin_args = [
   '-DMODULE_STRING="u64stream"',
   # VLC's N_() / config-set macros pass string literals through int casts;
@@ -20,9 +21,17 @@ plugin_args = [
   '-Wno-int-to-pointer-cast',
 ]
 
+plugin_deps = [vlc_plugin]
 plugin_link_args = []
+
 if host_machine.system() == 'linux' or host_machine.system() == 'freebsd'
   plugin_link_args += ['-Wl,--no-undefined']
+elif host_machine.system() == 'windows'
+  # Winsock 2 + advapi for inet_pton/inet_ntop and friends.
+  plugin_deps += [
+    cc.find_library('ws2_32'),
+    cc.find_library('iphlpapi'),
+  ]
 endif
 
 # Default install dir: VLC's per-user plugin path.
@@ -40,7 +49,7 @@ shared_module('u64stream_plugin',
   'src/u64stream.c',
   c_args: plugin_args,
   link_args: plugin_link_args,
-  dependencies: [vlc_plugin],
+  dependencies: plugin_deps,
   name_prefix: 'lib',
   install: true,
   install_dir: vlc_plugin_dir,

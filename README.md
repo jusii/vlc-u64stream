@@ -91,7 +91,8 @@ something else. Common alternatives:
 
 ## Building
 
-Requires GCC/Clang, Meson, Ninja, and the VLC plugin SDK headers.
+Requires Meson, Ninja, a C11 compiler, and the VLC plugin SDK headers
+(usually shipped as `vlc-plugin.pc` for pkg-config).
 
 ### Ubuntu / Debian
 
@@ -100,6 +101,41 @@ sudo apt install meson ninja-build build-essential libvlccore-dev libvlc-dev
 meson setup build
 meson compile -C build
 ```
+
+### Windows (MSYS2 / MinGW64)
+
+```sh
+# from the MINGW64 shell
+pacman -S --needed mingw-w64-x86_64-toolchain \
+                   mingw-w64-x86_64-meson \
+                   mingw-w64-x86_64-ninja \
+                   mingw-w64-x86_64-pkgconf \
+                   mingw-w64-x86_64-vlc
+meson setup build --buildtype=release
+meson compile -C build
+# Artefact: build/libu64stream_plugin.dll
+```
+
+Drop the `.dll` into `%APPDATA%\vlc\plugins\` (or VLC's `plugins\access\`
+directory) for it to be picked up.
+
+### macOS
+
+```sh
+brew install meson ninja pkg-config
+brew install --cask vlc            # provides the SDK headers in VLC.app
+
+# Point pkg-config at VLC.app's headers (the cask doesn't ship a .pc file).
+# See .github/workflows/build.yml for a copy-paste version.
+meson setup build --buildtype=release
+meson compile -C build
+# Artefact: build/libu64stream_plugin.dylib
+```
+
+### CI builds (GitHub Actions)
+
+Each push runs the full Linux + Windows + macOS matrix and uploads the
+shared modules as workflow artefacts. See [.github/workflows/build.yml](.github/workflows/build.yml).
 
 ### Install
 
