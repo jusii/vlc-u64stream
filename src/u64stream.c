@@ -346,9 +346,20 @@ struct demux_sys_t
 
 /* Open a UDP datagram socket for receiving.
  *
- *   bindhost: local address to bind, or "" for any.
+ *   bindhost: local interface address (specific iface), or "" for any.
+ *             Currently honoured only for unicast and for multicast with an
+ *             explicit local interface; bare-multicast use cases ignore it
+ *             and bind to the group on the kernel's default interface.
  *   group:    multicast group to join, or NULL for plain unicast.
- *   port:     UDP port (used for both bind and group).
+ *   port:     UDP port (used for both bind and the multicast group).
+ *
+ * Multicast quirk: when joining a group with no specific local interface,
+ * VLC's stock udp:// access calls net_OpenDgram with the *group* as the
+ * bind address and an empty server — that's the only invocation pattern
+ * that actually triggers IP_ADD_MEMBERSHIP via the multicast-bind branch
+ * inside net_OpenDgram. Passing the group as the server arg with bind=""
+ * silently fails to join the group on Linux 6.x — sockets open cleanly
+ * but no datagrams ever arrive. Match the stock pattern.
  */
 static int u64s_open_socket( demux_t *demux, const char *bindhost,
                              const char *group, int port,
@@ -359,13 +370,30 @@ static int u64s_open_socket( demux_t *demux, const char *bindhost,
         msg_Err( demux, "invalid %s port %d", label, port );
         return -1;
     }
-    /* net_OpenDgram(obj, bind_host, bind_port, server, server_port, proto)
-     * For multicast: server = group address; libvlccore handles
-     * IP_ADD_MEMBERSHIP / IPV6_JOIN_GROUP for us. */
-    int fd = net_OpenDgram( demux,
-                            bindhost ? bindhost : "", port,
-                            group ? group : "",      port,
-                            IPPROTO_UDP );
+
+    int fd;
+    if( group != NULL && *group != '\0' )
+    {
+        if( bindhost != NULL && *bindhost != '\0' )
+        {
+            /* Multicast on a specific local interface: bind=interface,
+             * server=group → net_OpenDgram joins the group. */
+            fd = net_OpenDgram( demux, bindhost, port, group, port,
+                                IPPROTO_UDP );
+        }
+        else
+        {
+            /* Bare multicast: bind=group, no server → multicast-bind
+             * branch joins the group on the default interface. */
+            fd = net_OpenDgram( demux, group, port, "", 0, IPPROTO_UDP );
+        }
+    }
+    else
+    {
+        /* Plain unicast bind. */
+        fd = net_OpenDgram( demux, bindhost ? bindhost : "", port,
+                            "", 0, IPPROTO_UDP );
+    }
     if( fd < 0 )
     {
         msg_Err( demux, "cannot bind UDP %s:%d (group %s) for %s (%s)",
