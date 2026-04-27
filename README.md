@@ -56,12 +56,28 @@ so you don't normally need `--u64stream-audio-group`.
 --u64stream-audio-port=N      Audio UDP port (default 0 = video-port + 1)
 --u64stream-audio-group=IP    Audio multicast group (default empty:
                               auto-derive from video group, last octet +1)
---u64stream-no-audio          Disable audio
+--u64stream-no-audio          Disable audio (video-only)
+--u64stream-no-video          Disable video (audio-only)
 --u64stream-mode=N            -1 = auto-detect (default), 0 = PAL, 1 = NTSC
 --u64stream-source=IP         Only accept packets from this source IP
                               (useful when several U64s share a LAN)
+--u64stream-on-loss=N         On packet loss: 0 = keep last frame's pixels
+                              (default, smoother), 1 = clear missing rows
+                              to black on each new frame
+--u64stream-control-host=H[:P]  Telnet (TCP/23 by default) into the C64U at H
+                              and send the F5 menu keystrokes that toggle the
+                              video+audio stream on. Fragile — depends on
+                              the U64 firmware menu layout. Leave empty if
+                              you start the stream manually.
 --u64stream-sar-num=N         Pixel aspect ratio numerator (0 = mode default)
 --u64stream-sar-den=N         Pixel aspect ratio denominator (0 = mode default)
+```
+
+Selected URL query parameters are also recognised, useful for embedding in
+`.m3u` playlists:
+
+```
+?source=IP    same as --u64stream-source=IP
 ```
 
 Aspect-ratio defaults match VICE's authentic VIC-II values:

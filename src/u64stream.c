@@ -155,6 +155,26 @@ static const uint32_t u64s_palette[16] = {
                                  "audio). Set explicitly to override.")
 #define U64S_NO_AUDIO_TEXT   N_("Disable audio")
 #define U64S_NO_AUDIO_LONG   N_("Don't open the audio UDP socket.")
+#define U64S_NO_VIDEO_TEXT   N_("Disable video")
+#define U64S_NO_VIDEO_LONG   N_("Don't open the video UDP socket. " \
+                                "Useful for audio-only listening.")
+#define U64S_ON_LOSS_TEXT    N_("On packet loss: 0=persist last frame, " \
+                                "1=clear missing rows to black")
+#define U64S_ON_LOSS_LONG    N_("If a video packet is dropped, by default " \
+                                "the affected rows show what was there in " \
+                                "the previous frame (smoother). Set to 1 " \
+                                "to instead clear the framebuffer to black " \
+                                "at every frame boundary so missing rows " \
+                                "are obvious.")
+#define U64S_CTLHOST_TEXT    N_("C64U control host (telnet) for auto-start")
+#define U64S_CTLHOST_LONG    N_("If set, after opening the UDP sockets we " \
+                                "TCP-connect to this host (default port 23) " \
+                                "and send the keystroke sequence the U64's " \
+                                "F5 menu uses to start the video+audio " \
+                                "stream. Format: 'host' or 'host:port'. " \
+                                "FRAGILE: depends on the U64 firmware menu " \
+                                "layout. Leave empty if you start the " \
+                                "stream manually from the device.")
 #define U64S_MODE_TEXT       N_("Video mode (-1=auto, 0=PAL, 1=NTSC)")
 #define U64S_MODE_LONG       N_("Pick PAL (50Hz/272 lines) or NTSC " \
                                 "(60Hz/240 lines), or -1 to detect from the " \
@@ -193,10 +213,16 @@ vlc_module_begin()
                  U64S_AUDIO_GROUP_TEXT, U64S_AUDIO_GROUP_LONG, false )
     add_bool   ( U64S_CFG_PREFIX "no-audio", false,
                  U64S_NO_AUDIO_TEXT, U64S_NO_AUDIO_LONG, false )
+    add_bool   ( U64S_CFG_PREFIX "no-video", false,
+                 U64S_NO_VIDEO_TEXT, U64S_NO_VIDEO_LONG, false )
     add_integer( U64S_CFG_PREFIX "mode", U64S_MODE_AUTO,
                  U64S_MODE_TEXT, U64S_MODE_LONG, false )
     add_string ( U64S_CFG_PREFIX "source", "",
                  U64S_SOURCE_TEXT, U64S_SOURCE_LONG, false )
+    add_integer( U64S_CFG_PREFIX "on-loss", 0,
+                 U64S_ON_LOSS_TEXT, U64S_ON_LOSS_LONG, false )
+    add_string ( U64S_CFG_PREFIX "control-host", "",
+                 U64S_CTLHOST_TEXT, U64S_CTLHOST_LONG, false )
     add_integer( U64S_CFG_PREFIX "sar-num", 0,
                  U64S_SARNUM_TEXT, U64S_SARNUM_LONG, true )
     add_integer( U64S_CFG_PREFIX "sar-den", 0,
@@ -237,6 +263,12 @@ struct demux_sys_t
     uint64_t        v_frames;
     uint16_t        v_last_seq;
     bool            v_saw_seq;
+    bool            v_first_boundary_seen; /* first bit15 marks "we joined
+                                              the stream"; emit only frames
+                                              captured cleanly between two
+                                              boundaries. */
+    bool            on_loss_clear;  /* true: memset framebuffer to 0 on
+                                       every new frame start. */
 
     /* Audio state. */
     es_out_id_t    *es_audio;
@@ -548,8 +580,27 @@ static int u64s_handle_video_packet( demux_t *demux, const uint8_t *pkt,
 
     if( last_of_frame && sys->detected )
     {
-        if( u64s_emit_frame( demux ) != VLC_SUCCESS )
-            return VLC_DEMUXER_EGENERIC;
+        /* The very first bit15 we see marks the END of a frame whose start
+         * we missed — the framebuffer has at most 4 valid lines plus
+         * black (zero) elsewhere. Skip emitting it; capture the next
+         * full frame between this boundary and the next. */
+        if( !sys->v_first_boundary_seen )
+        {
+            sys->v_first_boundary_seen = true;
+        }
+        else
+        {
+            if( u64s_emit_frame( demux ) != VLC_SUCCESS )
+                return VLC_DEMUXER_EGENERIC;
+            /* Optional: clear framebuffer so dropped packets in the new
+             * frame show as black rather than persisting last frame's
+             * pixels. */
+            if( sys->on_loss_clear )
+            {
+                memset( sys->frame_rgba, 0,
+                        (size_t)sys->width * U64S_FRAMEBUF_HEIGHT * 4u );
+            }
+        }
     }
     return VLC_DEMUXER_SUCCESS;
 }
@@ -755,7 +806,7 @@ static int Control( demux_t *demux, int query, va_list args )
 
 /* ---- URL helpers ------------------------------------------------------- */
 
-/* Parse an `[mcast-group]@[bind-host]:port` location into its components.
+/* Parse an `[mcast-group]@[bind-host]:port[?key=value&...]` location.
  * Either side of `@` may be empty. Examples:
  *
  *   u64://239.0.1.64@:11000        group=239.0.1.64, bind=*, port=11000
@@ -763,25 +814,60 @@ static int Control( demux_t *demux, int query, va_list args )
  *   u64://@:11000                  group=none, bind=*  (plain unicast)
  *   u64://192.168.2.10:11000       no group, bind=192.168.2.10
  *   u64://:11000                   no group, bind=*
+ *   u64://@:11000?source=192.168.2.64    embed source filter in URL
+ *
+ * Recognised query keys (override their --u64stream-* counterparts):
+ *   source=IP
  *
  * The `--u64stream-port` option overrides the port if the URL omits it.
  *
- * Caller frees both *out_group and *out_bind.
+ * Caller frees *out_group, *out_bind, and *out_query_source.
  */
 static void u64s_parse_url( demux_t *demux,
-                            char **out_group, char **out_bind, int *out_port )
+                            char **out_group, char **out_bind, int *out_port,
+                            char **out_query_source )
 {
-    *out_group = NULL;
-    *out_bind  = NULL;
-    *out_port  = (int)var_InheritInteger( demux, U64S_CFG_PREFIX "port" );
+    *out_group         = NULL;
+    *out_bind          = NULL;
+    *out_query_source  = NULL;
+    *out_port          = (int)var_InheritInteger( demux,
+                                                  U64S_CFG_PREFIX "port" );
 
     const char *loc = demux->psz_location;
     if( loc == NULL || *loc == '\0' )
         return;
 
-    /* Strip a trailing slash or query string. */
-    size_t cut = strcspn( loc, "/?" );
-    char *work = strndup( loc, cut );
+    /* Split off the query string (after '?'). */
+    const char *qs = strchr( loc, '?' );
+    if( qs != NULL )
+    {
+        const char *q = qs + 1;
+        while( *q != '\0' )
+        {
+            const char *amp = strchr( q, '&' );
+            size_t pair_len = amp ? (size_t)(amp - q) : strlen( q );
+            const char *eq = memchr( q, '=', pair_len );
+            if( eq != NULL )
+            {
+                size_t klen = (size_t)(eq - q);
+                size_t vlen = pair_len - klen - 1;
+                if( klen == 6 && strncmp( q, "source", 6 ) == 0 && vlen > 0 )
+                {
+                    free( *out_query_source );
+                    *out_query_source = strndup( eq + 1, vlen );
+                }
+                /* future: add &mode=, &audio=off, etc. here. */
+            }
+            if( amp == NULL ) break;
+            q = amp + 1;
+        }
+    }
+
+    size_t loc_len = qs ? (size_t)(qs - loc) : strlen( loc );
+    /* Strip a trailing slash if present (before the query). */
+    if( loc_len > 0 && loc[loc_len - 1] == '/' )
+        loc_len--;
+    char *work = strndup( loc, loc_len );
     if( work == NULL )
         return;
 
@@ -833,6 +919,90 @@ static void u64s_parse_url( demux_t *demux,
         *out_bind  = strdup( bindpart );
 
     free( work );
+}
+
+/* ---- Telnet auto-start ------------------------------------------------- */
+
+/* The U64 firmware exposes its on-screen menu over telnet (TCP/23). Sending
+ * the keystroke sequence below toggles the "Audio/Video Stream" entry in
+ * the F5 menu, which starts the UDP stream. Layout-dependent and FRAGILE,
+ * but matches the published firmware default and what u64view (WTFPL) uses
+ * for the same purpose. */
+static const uint8_t U64S_START_SEQ[] = {
+    0x1B, 0x5B, 0x31, 0x35, 0x7E,  /* F5 (CSI 15~) */
+    0x1B, 0x5B, 0x42,              /* arrow down */
+    0x1B, 0x5B, 0x42,
+    0x1B, 0x5B, 0x42,
+    0x1B, 0x5B, 0x42,
+    0x1B, 0x5B, 0x42,
+    0x1B, 0x5B, 0x42,
+    0x1B, 0x5B, 0x42,
+    0x1B, 0x5B, 0x42,              /* 8 arrow-downs total */
+    0x0D, 0x00,                    /* Enter */
+    0x0D, 0x00,
+    0x0D, 0x00,
+};
+
+/* Parse "host" or "host:port" into its components. Default port is 23. */
+static void u64s_split_host_port( const char *spec, char **host, int *port )
+{
+    *host = NULL;
+    *port = 23;
+    if( spec == NULL || *spec == '\0' )
+        return;
+    char *colon = strrchr( spec, ':' );
+    if( colon != NULL && colon != spec )
+    {
+        *host = strndup( spec, (size_t)(colon - spec) );
+        char *end = NULL;
+        long p = strtol( colon + 1, &end, 10 );
+        if( end != colon + 1 && p > 0 && p < 65536 )
+            *port = (int)p;
+    }
+    else
+    {
+        *host = strdup( spec );
+    }
+}
+
+/* Send the U64 start-stream keystroke sequence over a fresh TCP connection.
+ * Best-effort: any failure just logs a warning. */
+static void u64s_send_start_sequence( demux_t *demux, const char *spec )
+{
+    char *host = NULL;
+    int port = 23;
+    u64s_split_host_port( spec, &host, &port );
+    if( host == NULL || *host == '\0' )
+    {
+        free( host );
+        return;
+    }
+    msg_Info( demux, "sending stream-start sequence to %s:%d", host, port );
+
+    int fd = net_ConnectTCP( demux, host, port );
+    if( fd < 0 )
+    {
+        msg_Warn( demux, "cannot connect to control host %s:%d", host, port );
+        free( host );
+        return;
+    }
+
+    /* The U64 telnet endpoint processes one byte at a time slowly.
+     * Mimic u64view's pacing: short initial pause, then 1-byte sends. */
+    usleep( 10 * 1000 );
+    for( size_t i = 0; i < sizeof(U64S_START_SEQ); ++i )
+    {
+        usleep( 1 * 1000 );
+        ssize_t n = net_Write( demux, fd, &U64S_START_SEQ[i], 1 );
+        if( n <= 0 )
+        {
+            msg_Warn( demux,
+                      "control-host write failed at byte %zu", i );
+            break;
+        }
+    }
+    net_Close( fd );
+    free( host );
 }
 
 /* ---- Open / Close ------------------------------------------------------ */
@@ -889,8 +1059,29 @@ static int Open( vlc_object_t *obj )
                                 U64S_CFG_PREFIX "sar-num" );
     sys->sar_den_override = (int)var_InheritInteger( demux,
                                 U64S_CFG_PREFIX "sar-den" );
+    sys->on_loss_clear = var_InheritInteger( demux,
+                            U64S_CFG_PREFIX "on-loss" ) != 0;
 
-    char *src_str = var_InheritString( demux, U64S_CFG_PREFIX "source" );
+    /* Always allocate the larger framebuffer so we don't reallocate after
+     * mode auto-detection. */
+    sys->frame_rgba = calloc( 1,
+        (size_t)sys->width * U64S_FRAMEBUF_HEIGHT * 4u );
+    if( unlikely( sys->frame_rgba == NULL ) )
+    {
+        free( sys );
+        return VLC_ENOMEM;
+    }
+
+    char *group = NULL;
+    char *bindhost = NULL;
+    char *url_source = NULL;
+    int port_video = U64S_DEFAULT_PORT_VIDEO;
+    u64s_parse_url( demux, &group, &bindhost, &port_video, &url_source );
+
+    /* Resolve source filter: URL query overrides --u64stream-source. */
+    char *src_str = url_source;
+    if( src_str == NULL )
+        src_str = var_InheritString( demux, U64S_CFG_PREFIX "source" );
     if( src_str != NULL && *src_str != '\0' )
     {
         if( inet_pton( AF_INET, src_str, &sys->src ) == 1 )
@@ -906,33 +1097,38 @@ static int Open( vlc_object_t *obj )
     }
     free( src_str );
 
-    /* Always allocate the larger framebuffer so we don't reallocate after
-     * mode auto-detection. */
-    sys->frame_rgba = calloc( 1,
-        (size_t)sys->width * U64S_FRAMEBUF_HEIGHT * 4u );
-    if( unlikely( sys->frame_rgba == NULL ) )
-    {
-        free( sys );
-        return VLC_ENOMEM;
-    }
+    bool no_video = var_InheritBool( demux, U64S_CFG_PREFIX "no-video" );
+    bool no_audio = var_InheritBool( demux, U64S_CFG_PREFIX "no-audio" );
 
-    char *group = NULL;
-    char *bindhost = NULL;
-    int port_video = U64S_DEFAULT_PORT_VIDEO;
-    u64s_parse_url( demux, &group, &bindhost, &port_video );
-
-    sys->fd_video = u64s_open_socket( demux, bindhost, group,
-                                      port_video, "video" );
-    if( sys->fd_video < 0 )
+    if( no_video && no_audio )
     {
+        msg_Err( demux, "both video and audio disabled; nothing to do" );
         free( group );
         free( bindhost );
         free( sys->frame_rgba );
         free( sys );
+        atomic_fetch_sub( &u64s_live_instances, 1 );
         return VLC_EGENERIC;
     }
 
-    bool no_audio = var_InheritBool( demux, U64S_CFG_PREFIX "no-audio" );
+    if( !no_video )
+    {
+        sys->fd_video = u64s_open_socket( demux, bindhost, group,
+                                          port_video, "video" );
+        if( sys->fd_video < 0 )
+        {
+            free( group );
+            free( bindhost );
+            free( sys->frame_rgba );
+            free( sys );
+            atomic_fetch_sub( &u64s_live_instances, 1 );
+            return VLC_EGENERIC;
+        }
+    }
+    else
+    {
+        msg_Info( demux, "video disabled by --u64stream-no-video" );
+    }
     if( !no_audio )
     {
         int port_audio = (int)var_InheritInteger( demux,
@@ -984,6 +1180,15 @@ static int Open( vlc_object_t *obj )
     demux->p_sys      = sys;
     demux->pf_demux   = Demux;
     demux->pf_control = Control;
+
+    /* If asked, ping the U64's telnet menu to start streaming. Done last
+     * so the UDP sockets are already listening when packets begin. */
+    char *ctl_host = var_InheritString( demux,
+                        U64S_CFG_PREFIX "control-host" );
+    if( ctl_host != NULL && *ctl_host != '\0' )
+        u64s_send_start_sequence( demux, ctl_host );
+    free( ctl_host );
+
     return VLC_SUCCESS;
 }
 
