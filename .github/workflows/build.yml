@@ -30,6 +30,50 @@ jobs:
       - name: Show artefact
         run: ls -la build/libu64stream_plugin.so
 
+      - name: Install VLC for smoke test
+        run: |
+          sudo apt-get install -y vlc
+
+      - name: Runtime smoke test (synthetic sender → VLC)
+        run: |
+          set -e
+          # Start the synthetic U64 sender on loopback.
+          python3 tools/u64_test_sender.py --host 127.0.0.1 --port 11000 \
+            > /tmp/sender.log 2>&1 &
+          SENDER_PID=$!
+          # Give it a moment to start emitting.
+          sleep 0.5
+
+          # Run VLC headless against the loopback stream for ~3 s.
+          set +e
+          VLC_PLUGIN_PATH="$PWD/build" timeout 8s vlc -vv \
+            --intf dummy --vout dummy --aout dummy \
+            --no-video-title-show --run-time=3 \
+            'u64://@:11000?source=127.0.0.1' \
+            > /tmp/vlc.log 2>&1
+          set -e
+          kill $SENDER_PID 2>/dev/null || true
+          wait 2>/dev/null || true
+
+          echo "=== relevant VLC log lines ==="
+          grep -iE \
+            "u64stream|using .*decoder module|video output|Received first picture|Could not convert|playback too late|PCR called too late" \
+            /tmp/vlc.log | grep -ivE "configure" | head -30 || true
+
+          # Assertions
+          grep -q "U64 PAL: video 384x272 @ 50Hz" /tmp/vlc.log \
+            || { echo "FAIL: format announcement missing"; exit 1; }
+          grep -q 'using access_demux module "u64stream"' /tmp/vlc.log \
+            || { echo "FAIL: demux not selected"; exit 1; }
+          grep -q 'using video decoder module' /tmp/vlc.log \
+            || { echo "FAIL: video decoder did not engage"; exit 1; }
+          grep -q 'using audio decoder module' /tmp/vlc.log \
+            || { echo "FAIL: audio decoder did not engage"; exit 1; }
+          if grep -q "Could not convert timestamp" /tmp/vlc.log; then
+            echo "FAIL: timestamp conversion errors observed"; exit 1
+          fi
+          echo "smoke test passed"
+
       - uses: actions/upload-artifact@v4
         with:
           name: u64stream-linux-x86_64
@@ -157,3 +201,54 @@ jobs:
           name: u64stream-macos
           path: build/*.dylib
           if-no-files-found: error
+
+  # On v* tag push: gather the three platform artefacts, rename them with
+  # the tag version, and publish (or update) the corresponding GitHub
+  # Release. Idempotent — re-running the workflow on the same tag updates
+  # assets in place.
+  release:
+    name: Release
+    needs: [linux, windows, macos]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Stage release files
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF#refs/tags/}"
+          mkdir -p release
+          cp artifacts/u64stream-linux-x86_64/libu64stream_plugin.so \
+             "release/libu64stream_plugin-${TAG}-linux-x86_64.so"
+          cp artifacts/u64stream-windows-x86_64/libu64stream_plugin.dll \
+             "release/libu64stream_plugin-${TAG}-windows-x86_64.dll"
+          cp artifacts/u64stream-macos/libu64stream_plugin.dylib \
+             "release/libu64stream_plugin-${TAG}-macos-arm64.dylib"
+          ls -la release/
+
+      - name: Create or update GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF#refs/tags/}"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
+                  > /dev/null 2>&1; then
+            echo "Release $TAG exists; uploading/updating assets."
+            gh release upload "$TAG" release/* \
+              --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            echo "Creating release $TAG."
+            gh release create "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$TAG" \
+              --generate-notes \
+              release/*
+          fi
