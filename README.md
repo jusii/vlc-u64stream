@@ -161,14 +161,28 @@ For convenience you may want a shell alias:
 alias vlc-u64='VLC_PLUGIN_PATH=$HOME/.local/share/vlc/plugins vlc'
 ```
 
-**System-wide (auto-detected, no env var):**
+**System-wide on Linux (auto-detected by VLC, no env var needed):**
+
+VLC's distro-packaged build only scans the system plugin directory — on
+Debian/Ubuntu that's `/usr/lib/x86_64-linux-gnu/vlc/plugins/`. Meson's
+default prefix is `/usr/local`, which VLC will *not* scan, so you have to
+point the install at the real plugin dir explicitly:
 
 ```sh
+meson configure build \
+  -Dvlc_plugin_dir=/usr/lib/x86_64-linux-gnu/vlc/plugins/access
 sudo meson install -C build
+# Optional: regenerate VLC's plugin cache so it picks up the new module
+# without scanning everything at next launch.
+sudo /usr/lib/x86_64-linux-gnu/vlc/vlc-cache-gen \
+     /usr/lib/x86_64-linux-gnu/vlc/plugins
 ```
 
-By default that installs to `$libdir/vlc/plugins/access/`. Override with
-`-Dvlc_plugin_dir=…` at `meson setup`.
+After this, `vlc u64://@:11000` works from any shell with no env var.
+
+**Caveat:** when `apt upgrade` updates the `vlc-plugin-base` package it
+may overwrite the `access/` directory and remove the file. Re-run the
+`meson install` if that happens.
 
 ### Smoke test
 
