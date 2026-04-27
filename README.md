@@ -1,5 +1,7 @@
 # vlc-u64stream
 
+[![build](https://github.com/jusii/vlc-u64stream/actions/workflows/build.yml/badge.svg)](https://github.com/jusii/vlc-u64stream/actions/workflows/build.yml)
+
 > **Note on origin:** this project was developed with AI assistance (Anthropic
 > Claude, via the Claude Code CLI). All design decisions, protocol choices,
 > licensing, and final code review are by the human author; the AI did the
