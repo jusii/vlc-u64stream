@@ -50,9 +50,13 @@
 
 #ifdef _WIN32
 # define WIN32_LEAN_AND_MEAN
-# include <winsock2.h>
+# include <winsock2.h>     /* pollfd, WSAPoll (Vista+) */
 # include <ws2tcpip.h>
 # include <windows.h>
+  /* VLC's vlc_threads.h has an inline helper that calls poll(); on
+   * Windows there is no <poll.h>, so alias poll() to WSAPoll BEFORE any
+   * VLC header is included. The signatures match. */
+# define poll                   WSAPoll
 # define u64s_msleep(ms)        Sleep((DWORD)(ms))
 # define u64s_poll              WSAPoll
 # define U64S_INVALID_FD        (-1)

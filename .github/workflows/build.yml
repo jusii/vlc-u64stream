@@ -88,33 +88,60 @@ jobs:
       - name: Install build tools
         run: brew install meson ninja pkg-config
 
-      - name: Install VLC and locate SDK
+      - name: Install VLC, fetch plugin SDK headers, synthesise vlc-plugin.pc
         run: |
+          set -euo pipefail
           brew install --cask vlc
-          # The .app bundle ships the plugin headers inside it.
           VLC_APP="/Applications/VLC.app/Contents/MacOS"
-          if [ ! -d "$VLC_APP/include/vlc/plugins" ]; then
-            echo "VLC.app does not contain plugin headers at $VLC_APP/include/vlc/plugins" >&2
-            ls -la "$VLC_APP" || true
-            exit 1
-          fi
-          # Synthesize a vlc-plugin.pc so meson can find it.
+          ls -la "$VLC_APP"
+
+          # The cask only ships the public libvlc API headers under
+          # include/vlc/ — there's no include/vlc/plugins/ with the plugin
+          # SDK. Download the matching source tarball and extract the
+          # internal plugin headers (top-level include/vlc_*.h in the
+          # source tree map to <vlc/plugins/*.h> when installed).
+          VLC_VERSION="$(/Applications/VLC.app/Contents/MacOS/VLC --version 2>/dev/null | head -1 | awk '{print $3}')"
+          : "${VLC_VERSION:=3.0.23}"
+          echo "Detected VLC version: $VLC_VERSION"
+
+          SRC_URL="https://download.videolan.org/pub/videolan/vlc/${VLC_VERSION}/vlc-${VLC_VERSION}.tar.xz"
+          cd "$RUNNER_TEMP"
+          curl -fL -o vlc-src.tar.xz "$SRC_URL"
+          tar -xf vlc-src.tar.xz
+          SRCDIR="$RUNNER_TEMP/vlc-${VLC_VERSION}"
+
+          # Lay out the SDK headers in $RUNNER_TEMP/sdk-include with the
+          # standard install layout: vlc/plugins/vlc_*.h
+          SDK_INC="$RUNNER_TEMP/sdk-include"
+          mkdir -p "$SDK_INC/vlc/plugins"
+          # Public libvlc API (already in VLC.app, but keep things together).
+          cp -R "$SRCDIR/include/vlc/." "$SDK_INC/vlc/" 2>/dev/null || true
+          # Plugin SDK: top-level vlc_*.h in source -> vlc/plugins/ here.
+          cp "$SRCDIR/include/"vlc_*.h "$SDK_INC/vlc/plugins/"
+          ls "$SDK_INC/vlc/plugins/" | head -20
+
+          # Synthesise vlc-plugin.pc pointing at the extracted headers
+          # and the libvlccore .dylib inside the .app.
           PCDIR="$RUNNER_TEMP/pkgconfig"
           mkdir -p "$PCDIR"
-          VLC_VERSION="$(/Applications/VLC.app/Contents/MacOS/VLC --version | head -1 | awk '{print $3}')"
           cat > "$PCDIR/vlc-plugin.pc" <<EOF
           prefix=$VLC_APP
-          includedir=\${prefix}/include
+          sdk_includedir=$SDK_INC
           libdir=\${prefix}/lib
 
           Name: vlc-plugin
           Description: VLC plugin SDK
-          Version: ${VLC_VERSION:-3.0.0}
-          Cflags: -I\${includedir}/vlc/plugins -D__PLUGIN__ -D_FILE_OFFSET_BITS=64 -D_REENTRANT -D_THREAD_SAFE
+          Version: ${VLC_VERSION}
+          Cflags: -I\${sdk_includedir}/vlc/plugins -D__PLUGIN__ -D_FILE_OFFSET_BITS=64 -D_REENTRANT -D_THREAD_SAFE
           Libs: -L\${libdir} -lvlccore
           EOF
           echo "PKG_CONFIG_PATH=$PCDIR" >> "$GITHUB_ENV"
           cat "$PCDIR/vlc-plugin.pc"
+
+          # The .dylib in VLC.app/Contents/MacOS/lib has unstable names;
+          # if linking fails we'll need an explicit -L. For now point at
+          # the install prefix and let the linker find libvlccore.dylib.
+          ls "$VLC_APP/lib" | head -20
 
       - name: Configure
         run: meson setup build --buildtype=release
